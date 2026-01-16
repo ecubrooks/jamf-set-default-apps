@@ -28,7 +28,7 @@ This fork/variant focuses on:
 - Parameter-driven configuration (presets or custom lists)
 - Easier rebranding and support for different environments
 
-Original repository (SetDefaultApps folder): ![ScottEKendall/JAMF-Pro-Scripts.](https://github.com/ScottEKendall/JAMF-Pro-Scripts/tree/main/SetDefaultApps)
+Original repository (SetDefaultApps folder): [ScottEKendall/JAMF-Pro-Scripts.](https://github.com/ScottEKendall/JAMF-Pro-Scripts/tree/main/SetDefaultApps)
 
 ---
 
