@@ -1,15 +1,33 @@
 #!/bin/zsh
 #
-# SetDefaultApps.sh
+# SetDefaultApps.zsh
 #
-# by: Scott Kendall
+# Authors: Scott Kendall, ecubrooks
+# Created:  2025-12-11
+# Updated:  2026-01-13
 #
-# Written: 12/11/2025
-# Last updated: 12/11/2025
+# Purpose:
+#   Present a SwiftDialog UI that allows a user to set default handlers for
+#   selected URL schemes and file extensions using utiluti.
 #
-# Script Purpose: set the default UTI applications (mailto, url, http, etc)
+# Jamf Script Parameters (4–9):
+# $4: Preset name OR comma-separated list of UTIs / URL schemes
+#       Presets: browser-only | email-only | docs-only
+#       Custom:  https,mailto,pdf,docx,xlsx,txt,md
+# $5 = swiftDialog binary path (default: /usr/local/bin/dialog)
+# $6 = Jamf policy trigger to install/update swiftDialog
+# $7 = Jamf policy trigger to install utiluti
+# $8 = Jamf policy trigger to install support files (optional)
+# $9 = Support URL (used for Help / QR code)
 #
-# 1.0 - Initial
+# Change Log:
+#   1.0  - Initial
+#   1.1  - Removed reliance on system_profiler for faster startup and more reliable system info
+#        - Fixed mktemp usage to use SCRIPT_NAME
+#        - Improved utiluti detection to avoid needless installs
+#   2.0  - Modified script and Added Jamf customization options (presets / user-selected lists)
+#
+######################################################################################################
 
 ######################################################################################################
 #
@@ -17,80 +35,152 @@
 #
 ######################################################################################################
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# Script identity (used for temp files and logging)
 SCRIPT_NAME="SetDefaultApps"
+# Logged-in console user details (used for runAsUser and personalization)
 LOGGED_IN_USER=$( scutil <<< "show State:/Users/ConsoleUser" | awk '/Name :/ && ! /loginwindow/ { print $3 }' )
 USER_DIR=$( dscl . -read /Users/${LOGGED_IN_USER} NFSHomeDirectory | awk '{ print $2 }' )
 USER_UID=$(id -u "$LOGGED_IN_USER")
 
-[[ "$(/usr/bin/uname -p)" == 'i386' ]] && HWtype="SPHardwareDataType.0.cpu_type" || HWtype="SPHardwareDataType.0.chip_type"
-
-SYSTEM_PROFILER_BLOB=$( /usr/sbin/system_profiler -json 'SPHardwareDataType')
-MAC_CPU=$( echo $SYSTEM_PROFILER_BLOB | /usr/bin/plutil -extract "${HWtype}" 'raw' -)
-MAC_RAM=$( echo $SYSTEM_PROFILER_BLOB | /usr/bin/plutil -extract 'SPHardwareDataType.0.physical_memory' 'raw' -)
+# Basic system metrics
 FREE_DISK_SPACE=$(($( /usr/sbin/diskutil info / | /usr/bin/grep "Free Space" | /usr/bin/awk '{print $6}' | /usr/bin/cut -c 2- ) / 1024 / 1024 / 1024 ))
-
-ICON_FILES="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/"
-UTI_COMMAND="/usr/local/bin/utiluti"
-
+MACOS_NAME=$( /usr/bin/sw_vers -productName )
+MACOS_VERSION=$( /usr/bin/sw_vers -productVersion )
+MAC_RAM=$( /usr/sbin/sysctl -n hw.memsize 2>/dev/null | /usr/bin/awk '{printf "%.0f GB", $1/1024/1024/1024}' )
+MAC_CPU=$( /usr/sbin/sysctl -n machdep.cpu.brand_string 2>/dev/null )
+# CPU Fallback to uname ONLY if sysctl failed
+if [[ -z "$MAC_CPU" ]]; then
+    if [[ "$(/usr/bin/uname -m)" == "arm64" ]]; then
+        MAC_CPU="Apple Silicon"
+    else
+        MAC_CPU="Intel"
+    fi
+fi
 # Swift Dialog version requirements
-
-SW_DIALOG="/usr/local/bin/dialog"
+DIALOG_BINARY="${5:-/usr/local/bin/dialog}" # Parameter 5: SwiftDialog binary path
 MIN_SD_REQUIRED_VERSION="2.5.0"
-[[ -e "${SW_DIALOG}" ]] && SD_VERSION=$( ${SW_DIALOG} --version) || SD_VERSION="0.0.0"
 
-SD_DIALOG_GREETING=$((){print Good ${argv[2+($1>11)+($1>18)]}} ${(%):-%D{%H}} morning afternoon evening)
+if [[ -e "${DIALOG_BINARY}" ]]; then
+    SD_VERSION="$("${DIALOG_BINARY}" --version)"
+else
+    SD_VERSION="0.0.0"
+fi
+
+# IT support url
+supportURL="${9:-https://support.example.com}"
 
 # Make some temp files
 
-JSON_DIALOG_BLOB=$(mktemp /var/tmp/ExtractBundleIDs.XXXXX)
-DIALOG_COMMAND_FILE=$(mktemp /var/tmp/ExtractBundleIDs.XXXXX)
-chmod 666 $JSON_DIALOG_BLOB
-chmod 666 $DIALOG_COMMAND_FILE
+JSON_DIALOG_BLOB=$(mktemp /var/tmp/${SCRIPT_NAME}.XXXXX)
+DIALOG_COMMAND_FILE=$(mktemp /var/tmp/${SCRIPT_NAME}.XXXXX)
+chmod 644 "$JSON_DIALOG_BLOB"
+chmod 644 "$DIALOG_COMMAND_FILE"
 
-###################################################
-#
-# App Specific variables (Feel free to change these)
-#
-###################################################
-   
-# See if there is a "defaults" file...if so, read in the contents
-DEFAULTS_DIR="/Library/Managed Preferences/com.gianteaglescript.defaults.plist"
+# =======================================================================
+# Banner Image Logic
+# =======================================================================
+pick_random_image() {
+    # PURPOSE: Return a random banner image URL for Dialog
+    # RETURN: URL string
+    # List of Image Urls
+    local imageurls=(
+        # Add urls or local images ex: https://example.com/banner.png"
+    )
+    # Fallback macOS image (choose file on system)
+    local macos_fallback="/Library/Desktop Pictures/Sky.jpg"
+    
+    # If array is empty, use macOS fallback
+    if (( ${#imageurls[@]} == 0 )); then
+        printf "%s\n" "$macos_fallback"
+        return 0
+    fi
+    printf "%s\n" "${imageurls[RANDOM % ${#imageurls[@]}]}"
+}
+
+# See if there is a "defaults" file...if exists, read in the contents
+# Update defaults plist to desired contents
+DEFAULTS_DIR="/Library/Managed Preferences/defaults.plist"
 if [[ -e $DEFAULTS_DIR ]]; then
     echo "Found Defaults Files.  Reading in Info"
     SUPPORT_DIR=$(defaults read $DEFAULTS_DIR "SupportFiles")
-    SD_BANNER_IMAGE=$SUPPORT_DIR$(defaults read $DEFAULTS_DIR "BannerImage")
+    SD_BANNER_LOCAL_IMAGE=$(defaults read $DEFAULTS_DIR "BannerImage")
+    SD_BANNER_IMAGE=$SD_BANNER_LOCAL_IMAGE
     spacing=$(defaults read $DEFAULTS_DIR "BannerPadding")
 else
-    SUPPORT_DIR="/Library/Application Support/GiantEagle"
-    SD_BANNER_IMAGE="${SUPPORT_DIR}/SupportFiles/GE_SD_BannerImage.png"
+    SD_BANNER_IMAGE="$(pick_random_image)"
     spacing=5 #5 spaces to accommodate for icon offset
 fi
 repeat $spacing BANNER_TEXT_PADDING+=" "
 
-# Log files location
-
-LOG_FILE="${SUPPORT_DIR}/logs/${SCRIPT_NAME}.log"
-
 # Display items (banner / icon)
-
 SD_WINDOW_TITLE="${BANNER_TEXT_PADDING}Default Apps Selection"
 SD_ICON="/System/Applications/App Store.app"
+ICON_FILES="/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/"
 OVERLAY_ICON=$ICON_FILES"ToolbarCustomizeIcon.icns"
 
-# Trigger installs for Images & icons
+# UTI CLI 
+UTI_COMMAND="/usr/local/bin/utiluti"
 
-DIALOG_INSTALL_POLICY="install_SwiftDialog"
-SUPPORT_FILE_INSTALL_POLICY="install_SymFiles"
-UTILUTI_INSTALL_POLICY="install_utiluti"
+# =======================================================================
+# Log files location
+# =======================================================================
+LOG_FILE="/Library/Logs/${SCRIPT_NAME}.log"
+
+# =======================================================================
+# Greeting 
+# =======================================================================
+hour=${(%):-%D{%H}}
+hour=$((10#$hour)) 
+greeting=(morning afternoon evening)
+SD_DIALOG_GREETING="Good ${greeting[2+($hour>11)+($hour>18)]}"
+
+################################################################################
+# Jamf Parameter Parsing (with presets)
+################################################################################
+# PURPOSE: Interpret Jamf Parameter 4 as either:
+#     - a preset name (browser-only | email-only | docs-only), or
+#     - a comma-separated list of UTIs / URL schemes (https,mailto,pdf,...)
+#
+# OUTPUT: UTI_LIST (array)
+RAW_UTI_LIST="${4:-docs-only}" # Parameter 4
+
+if [[ -z "$RAW_UTI_LIST" ]]; then
+    logMe "ERROR: No UTI list or preset provided"
+    exit 1
+fi
+
+RAW_UTI_LIST="${RAW_UTI_LIST:l}"
+RAW_UTI_LIST="${RAW_UTI_LIST// /}"
+
+case "$RAW_UTI_LIST" in
+    browser-only)
+        UTI_LIST=(https)
+        PRESET_NOTE="**Preset:** Browser defaults only<br><br>"
+    ;;
+    email-only)
+        UTI_LIST=(mailto)
+        PRESET_NOTE="**Preset:** Email defaults only<br><br>"
+    ;;
+    docs-only)
+        UTI_LIST=(pdf docx xlsx txt)
+        PRESET_NOTE="**Preset:** Document file defaults only<br><br>"
+    ;;
+    *)
+        IFS=',' read -rA UTI_LIST <<< "$RAW_UTI_LIST"
+        PRESET_NOTE=""
+    ;;
+esac
 
 ##################################################
 #
 # Passed in variables
 # 
 #################################################
+# Policy trigger names (Jamf custom triggers)
+DIALOG_INSTALL_POLICY="${6:-installswiftDialog}" # Jamf Parameter 6: Jamf policy trigger to install SwiftDialog if missing/outdated
+UTILUTI_INSTALL_POLICY="${7:-install_utiluti}" # Jamf Parameter 7: Jamf policy trigger to install utiluti if missing
+SUPPORT_FILE_INSTALL_POLICY="${8:-install_support}" # Jamf Parameter 8: Jamf policy trigger to install support files for banner
 
-JAMF_LOGGED_IN_USER=${3:-"$LOGGED_IN_USER"}    # Passed in by JAMF automatically
-SD_FIRST_NAME="${(C)JAMF_LOGGED_IN_USER%%.*}"    
 
 ####################################################################################################
 #
@@ -100,7 +190,7 @@ SD_FIRST_NAME="${(C)JAMF_LOGGED_IN_USER%%.*}"
 
 function create_log_directory ()
 {
-    # Ensure that the log directory and the log files exist. If they
+    # PURPOSE: Ensure that the log directory and the log files exist. If they
     # do not then create them and set the permissions.
     #
     # RETURN: None
@@ -117,10 +207,10 @@ function create_log_directory ()
 
 function logMe () 
 {
-    # Basic two pronged logging function that will log like this:
-    #
-    # 20231204 12:00:00: Some message here
-    #
+    # PURPOSE: Basic two pronged logging function that will log like this:
+    # 20231204 12:00:00: Log Message
+    #    
+    # Format: YYYY-MM-DD HH:MM:SS: message
     # This function logs both to STDOUT/STDERR and a file
     # The log file is set by the $LOG_FILE variable.
     #
@@ -128,18 +218,29 @@ function logMe ()
     echo "$(/bin/date '+%Y-%m-%d %H:%M:%S'): ${1}" | tee -a "${LOG_FILE}" 1>&2
 }
 
+function install_swift_dialog ()
+{
+    # PURPOSE: Install Swift dialog From JAMF 
+    # PARMS Expected: DIALOG_INSTALL_POLICY - policy trigger from JAMF
+    #
+    # RETURN: None
+    
+    /usr/local/bin/jamf policy -trigger ${DIALOG_INSTALL_POLICY}
+}
+
+
 function check_swift_dialog_install ()
 {
-    # Check to make sure that Swift Dialog is installed and functioning correctly
-    # Will install process if missing or corrupted
+    # PURPOSE: Check to make sure that Swift Dialog is installed and meets minimum required version
+    # If missing/outdated, install via Jamf policy trigger.
     #
     # RETURN: None
 
     logMe "Ensuring that swiftDialog version is installed..."
-    if [[ ! -x "${SW_DIALOG}" ]]; then
+    if [[ ! -x "${DIALOG_BINARY}" ]]; then
         logMe "Swift Dialog is missing or corrupted - Installing from JAMF"
         install_swift_dialog
-        SD_VERSION=$( ${SW_DIALOG} --version)        
+        SD_VERSION=$( ${DIALOG_BINARY} --version)        
     fi
 
     if ! is-at-least "${MIN_SD_REQUIRED_VERSION}" "${SD_VERSION}"; then
@@ -150,56 +251,77 @@ function check_swift_dialog_install ()
     fi
 }
 
-function install_swift_dialog ()
-{
-    # Install Swift dialog From JAMF
-    # PARMS Expected: DIALOG_INSTALL_POLICY - policy trigger from JAMF
-    #
-    # RETURN: None
-
-	/usr/local/bin/jamf policy -trigger ${DIALOG_INSTALL_POLICY}
-}
-
 function check_support_files ()
 {
-    [[ ! -e "${SD_BANNER_IMAGE}" ]] && /usr/local/bin/jamf policy -trigger ${SUPPORT_FILE_INSTALL_POLICY}
-    [[ $(which utiluti) == *"not found"* ]] &&  /usr/local/bin/jamf policy -trigger ${UTILUTI_INSTALL_POLICY}
+    # PURPOSE: Ensure required support assets exist: swift, banner_image and uti
+    #
+    # RETURN: None
+    
+    check_swift_dialog_install
+    
+    # Optional: Remove comment # to check if local banner image exists
+    #if [[ ! -e "${SD_BANNER_LOCAL_IMAGE}" ]]; then
+    #    /usr/local/bin/jamf policy -trigger "${SUPPORT_FILE_INSTALL_POLICY}"
+    #fi
+    
+    if [[ "$(which utiluti 2>/dev/null)" == *"not found"* ]]; then
+        /usr/local/bin/jamf policy -trigger "${UTILUTI_INSTALL_POLICY}"
+    fi
 }
-
 function create_infobox_message()
 {
-	################################
-	#
-	# Swift Dialog InfoBox message construct
-	#
-	################################
-
+	# Swift Dialog infoBox message construct, feel free to update.
+    # PURPOSE: Build the "infobox" string shown in SwiftDialog.
+    #
+    # RETURN: None
+    
 	SD_INFO_BOX_MSG="## System Info ##<br>"
-	SD_INFO_BOX_MSG+="${MAC_CPU}<br>"
-	SD_INFO_BOX_MSG+="{serialnumber}<br>"
-	SD_INFO_BOX_MSG+="${MAC_RAM} RAM<br>"
-	SD_INFO_BOX_MSG+="${FREE_DISK_SPACE}GB Available<br>"
-	SD_INFO_BOX_MSG+="{osname} {osversion}<br>"
+    SD_INFO_BOX_MSG+="<br>"
+    SD_INFO_BOX_MSG+="{computername}"
+    SD_INFO_BOX_MSG+="<br>"
+    SD_INFO_BOX_MSG+="macOS {osname} {osversion}"
+    SD_INFO_BOX_MSG+="<br>"
+	#SD_INFO_BOX_MSG+="${MAC_CPU}<br>"  # remove hash if you wish to use
+    #SD_INFO_BOX_MSG+="<br>"
+    SD_INFO_BOX_MSG+="{computermodel}"
+    SD_INFO_BOX_MSG+="<br>"
+	SD_INFO_BOX_MSG+="{serialnumber}"
 }
 
 function cleanup_and_exit ()
 {
-	[[ -f ${JSON_OPTIONS} ]] && /bin/rm -rf ${JSON_OPTIONS}
-	[[ -f ${TMP_FILE_STORAGE} ]] && /bin/rm -rf ${TMP_FILE_STORAGE}
-    [[ -f ${DIALOG_COMMAND_FILE} ]] && /bin/rm -rf ${DIALOG_COMMAND_FILE}
-	exit $1
+    
+    # PURPOSE: Remove temp files (if present) and exit with provided code.
+    #
+    # PARMS: $1 = exit code
+    #
+    # RETURN: exits script
+    if [[ -f "${JSON_DIALOG_BLOB}" ]]; then
+        /bin/rm -rf "${JSON_DIALOG_BLOB}"
+    fi
+    
+    if [[ -f "${DIALOG_COMMAND_FILE}" ]]; then
+        /bin/rm -rf "${DIALOG_COMMAND_FILE}"
+    fi
+    
+    exit "$1"
 }
 
 function runAsUser () 
 {
+    # PURPOSE: Run a command as the currently logged in user (console user).
+    #
+    # PARMS: $@ = command and arguments to execute
+    #
+    # RETURN: Command output
     launchctl asuser "$USER_UID" sudo -u "$LOGGED_IN_USER" "$@"
 }
 
 function get_uti_results ()
 {
-    # PURPOSE: format the uti results into an array and remove the files that are not in the /Applications or /System/Applications folder
-    # PRAMS: $1 = utiluti extension to look for
-    # RETURN: formatted list of applications
+    # PURPOSE: Format the uti results into an array and remove the files that are not in the /Applications or /System/Applications folder
+    # PRAMS: $1 = utiluti extension to look up
+    # RETURN: A formatted list of applications
     # EXPECTED: None
 
     declare utiResults
@@ -211,6 +333,7 @@ function get_uti_results ()
         utiResults=$(runAsUser $UTI_COMMAND get-uti ${1})
         utiResults=$(runAsUser $UTI_COMMAND type list ${utiResults})
     fi
+    # Remove the prefixes from the app names
     cleanResults=$(echo "${utiResults}" |  grep -E '^(/System|/Applications)' | sed -e 's|^/Applications/||' -e 's|^/System/Applications/||' -e 's|^/System/Volumes/Preboot/Cryptexes/App/System/Applications/||' -e 's|^/System/Library/CoreServices/||' ) #remove the prefixes from the app names
     resultsArray=("${(@f)cleanResults}")
     for item in "${resultsArray[@]}"; do
@@ -221,7 +344,7 @@ function get_uti_results ()
 
 function get_default_uti_app ()
 {
-    # PURPOSE: determine the default app for the uti prefix
+    # PURPOSE: Determine the current default app for the uti prefix
     # PRAMS: $1 = utiluti command to run
     # RETURN: app assigned to that uti
     # EXPECTED: None
@@ -235,19 +358,24 @@ function get_default_uti_app ()
 
 function set_uti_results ()
 {
-    # PURPOSE: Set the default app for the given extension type
-    # PRAMS: $1 - Default Application to set
-    #        $2 - File Type extension to change 
-    # RETURN: None
+    # PURPOSE: Set the default handler for a URL scheme OR file type (via UTI)  based on a selected app
+    # PRAMS:
+    #   $1 = Default Application name (e.g., "Safari.app") - may include quotes
+    #   $2 = URL scheme OR file extension token (https, mailto, pdf, docx, etc.)
+    # RETURN: 0 on skip (no selection), otherwise bubbles utiluti outcome to logs
     # EXPECTED: None
+
     declare tmp
     declare bundleId
     declare appName="${1//\"/}" 
     declare filePath
     declare results
-
-    # Look up the default bundleID that is associated currently
-    defaultBundleId=$(runAsUser $UTI_COMMAND get-uti ${2})
+    
+    # Check if appname is blank or null
+    if [[ -z "$appName" || "$appName" == "null" ]]; then
+        logMe "Skipping $2 (no app selected)"
+        return 0
+    fi
 
     # Locate where the file is on the system
     if [[ -e "/Applications/$appName" ]]; then
@@ -258,28 +386,54 @@ function set_uti_results ()
         filePath="/System/Library/CoreServices/$appName"
     fi
 
-    # Look up the bundleID of the app that we are changing it to
+    # Look up the bundleID of the app that we are changing
     bundleId=$(runAsUser $UTI_COMMAND app id "${filePath}")
+    if [[ -z "$bundleId" || "$bundleId" == "null" ]]; then    
+        logMe "ERROR: Could not determine bundleId for '$appName' ($filePath)"
+        return 1
+    fi
 
-    # Evaluate the options and set the UTI command accordingly
+
+    # Evaluate the options and set the UTI command accordingly    
     case "${2:l}" in
-        http|ftp|ssh|mailto)
-            results=$(runAsUser $UTI_COMMAND url set "${2:l}" "$bundleId")
-            ;;
+        http|https|ftp|mailto)
+            results=$(runAsUser "$UTI_COMMAND" url set "${2:l}" "$bundleId")
+        ;;
         *)
-            results=$(runAsUser $UTI_COMMAND type set $defaultBundleId $bundleId)
-            ;;
+            defaultBundleId=$(runAsUser "$UTI_COMMAND" get-uti "$2")
+            if [[ -z "$defaultBundleId" || "$defaultBundleId" == "null" ]]; then
+                logMe "ERROR: Could not determine UTI for '$2' (defaultBundleId blank)"
+                return 1
+            fi
+            results=$(runAsUser "$UTI_COMMAND" type set "$defaultBundleId" "$bundleId")
+        ;;
     esac
+
     logMe "Results: $results"
 }
 
 function construct_dialog_header_settings ()
 {
-    # Construct the basic Swift Dialog screen info that is used on all messages
+    # PURPOSE:
+    #   Construct the common SwiftDialog JSON header used for the window.
+    #   This is written to STDOUT and redirected to JSON_DIALOG_BLOB.
     #
-    # RETURN: None
-	# VARIABLES expected: All of the Window variables should be set
-	# PARMS Passed: $1 is message to be displayed on the window
+    # VARIABLES expected:
+    #   SD_ICON, SD_BANNER_IMAGE, SD_INFO_BOX_MSG, OVERLAY_ICON,
+    #   SD_WINDOW_TITLE, SD_VERSION, supportURL, LOGGED_IN_USER, USER_UID
+    #
+    # PARMS:
+    #   $1 = message string displayed at the top of the dialog
+    #
+    # RETURN: JSON snippet
+
+    # =======================================================================
+    # Help Message Variables
+    # =======================================================================
+    
+    help_message="**App Usage:** Choose what application(s) you want to open a particular type of file with dropdown menu(s).<br><br>**Support Info:** Click on the 'More Info' button for support or scan QR code. Please use provide the following information:<br><br>**User Info:** <br>- **Full Name:** {userfullname}<br>- **User Account Name:** ${LOGGED_IN_USER}<br>- **User ID:** ${USER_UID}<br><br>**Computer Information:**<br>- **macOS:** {osversion} ({osname})<br>- **Computer Name:** {computername}<br>- **Serial Number:** {serialnumber}<br><br>**Dialog:** <br>- **Version:** ${SD_VERSION}"
+    
+    helpimage="qr=${supportURL}"
 
 	echo '{
         "icon" : "'${SD_ICON}'",
@@ -289,10 +443,11 @@ function construct_dialog_header_settings ()
         "overlayicon" : "'${OVERLAY_ICON}'",
         "ontop" : "true",
         "bannertitle" : "'${SD_WINDOW_TITLE}'",
-        "titlefont" : "shadow=1",
-        "helpmessage" : "Choose what application(s) you want to open a particular type of file with.<br>Click on the 'More Info' button for assistance on setting UTI types.",
+        "titlefont" : "name=Avenir Next,shadow=1",
+        "helpmessage" : "'${help_message}'",
+        "helpimage" : "'"${helpimage}"'",
         "infobutton" : "More Info",
-        "infobuttonaction" : "https://github.com/scriptingosx/utiluti",        
+        "infobuttonaction" : "'${supportURL}'",        
         "width" : 920,
         "height" : 520,
         "button1text" : "OK",
@@ -305,87 +460,38 @@ function construct_dialog_header_settings ()
 
 function create_dropdown_message_body ()
 {
-    # PURPOSE: Construct the List item body of the dialog box
-    # "listitem" : [
-    #			{"title" : "macOS Version:", "icon" : "/System/Library/CoreServices/CoreTypes.bundle/Contents/Resources/FinderIcon.icns", "status" : "${macOS_version_icon}", "statustext" : "$sw_vers"},
-
-    # RETURN: None
-    # EXPECTED: message
-    # PARMS: $1 - title (Display)
-    #        $2 - values (comma separated list)
-    #        $3 - default item
-    #        $4 - first or last - construct appropriate listitem heders / footers
-    #        $5 - Trailing closure commands
-    #        $6 - Name of dropdown item
-
-    declare line && line=""
-  
-    [[ "$4:l" == "first" ]] && line+=' "selectitems" : ['
-    [[ ! -z $1 ]] && line+='{"title" : "'$1'", "values" : ['$2']'
-    [[ ! -z $3 ]] && line+=', "default" : "'$3'"'
-    [[ ! -z $6 ]] && line+=', "name" : "'$6'", "required" : "true", '
-    [[ ! -z $5 ]] && line+="$5"
-    [[ "$4:l" == "last" ]] && line+='],'
-    echo $line >> ${JSON_DIALOG_BLOB}
-}
-
-function create_dropdown_list ()
-{
     # PURPOSE: Create the dropdown list for the dialog box
-    # RETURN: None
-    # EXPECTED: JSON_DIALOG_BLOB should be defined
-    # PARMS: $1 - message to be displayed on the window
-    #        $2 - tyoe of data to parse XML or JSON
-    #        #3 - key to parse for list items
-    #        $4 - string to parse for list items
-    # EXPECTED: None
-    declare -a array
-
-    construct_dialog_header_settings $1 > "${JSON_DIALOG_BLOB}"
-    create_dropdown_message_body "" "" "first"
-
-    # Parse the XML or JSON data and create list items
+    # EXPECTED: JSON_DIALOG_BLOB exists and is writable
+    # PRAMS:
+    #   $1 = Label/title shown in Dialog (e.g., "Web Browser (https):")
+    #   $2 = Dropdown "values" list as JSON array items (e.g., "\"Safari.app\",\"Chrome.app\"")
+    #   $3 = Default selected value (optional)
+    #   $4 = Position marker: first | last | (anything else = middle)
+    #   $5 = (unused by current calls; preserved)
+    #   $6 = Field name + required flag (optional)
     
-    if [[ "$2:l" == "json" ]]; then
-        # If the second parameter is XML, then parse the XML data
-        xml_blob=$(echo $4 | jq -r '.results[]'$3)
-    else
-        # If the second parameter is JSON, then parse the JSON data
-        xml_blob=$(echo $4 | xmllint --xpath '//'$3 - 2) #>/dev/null)
+    local line=""
+    local pos="${4:l}"
+    local values="$2"
+    
+    # HARD TRIM: kill trailing comma if present
+    values="${values%,}"
+    
+    if [[ "$pos" == "first" ]]; then
+        line+='"selectitems" : ['
     fi
     
-    echo $xml_blob | while IFS= read -r line; do
-        # Remove the <name> and </name> tags from the line and trailing spaces
-        line="${${line#*<name>}%</name>*}"
-        line=$(echo $line | sed 's/[[:space:]]*$//')
-        array+='"'$line'",'
-    done
-    # Remove the trailing comma from the array
-    array="${array%,}"
-    create_dropdown_message_body "Select Groups:" "$array" "last"
-
-    #create_dropdown_message_body "" "" "last"
-    update_display_list "Create"
-}
-
-function construct_dropdown_list_items ()
-{
-    # PURPOSE: Construct the list of items for the dropdowb menu
-    # RETURN: formatted list of items
-    # EXPECTED: None
-    # PARMS: $1 - XML variable to parse 
-    declare xml_blob
-    declare line
-    xml_blob=$(echo $1 |jq -r '.computer_groups[] | "\(.id) - \(.name)"')
-    echo $xml_blob | while IFS= read -r line; do
-        # Remove the <name> and </name> tags from the line and trailing spaces
-        line="${${line#*<name>}%</name>*}"
-        line=$(echo $line | sed 's/[[:space:]]*$//')
-        array+='"'$line'",'
-    done
-    # Remove the trailing comma from the array
-    array="${array%,}"
-    echo $array
+    if [[ -n "$1" ]]; then
+        line+="{\"title\" : \"$1\", \"values\" : [$values]"
+        [[ -n "$3" ]] && line+=', "default" : "'"$3"'"'
+        [[ -n "$6" ]] && line+=', "name" : "'"$6"'", "required" : "true"'
+        line+="}"
+    fi
+    
+    if [[ "$pos" == "last" ]]; then
+        line+="],"
+    fi
+    echo "$line" >> "$JSON_DIALOG_BLOB"
 }
 
 ####################################################################################################
@@ -394,6 +500,7 @@ function construct_dropdown_list_items ()
 #
 ####################################################################################################
 
+# Arrays used to store the available application values for each file type
 declare -a utiHttp
 declare -a utiMailTo
 declare -a utiFtp
@@ -402,18 +509,15 @@ declare -a utiDoc
 declare -a utiTxt
 declare -a utiPDF
 
-autoload 'is-at-least'
+# SwiftDialog helper autoload (version compare)
+autoload -Uz 'is-at-least'
 
+# Setup logging / dependencies / UI info
 create_log_directory
-check_swift_dialog_install
 check_support_files
 create_infobox_message
 
-# read in the applications for each file type
-# Customize your own extension list here
-# call the "set_uti" function for each file type extension
-# if this list gets extensive, you will need to adjust the window height in the "construct_display_header_settings" function
-
+# Build application lists for each supported item (values for dropdowns)
 logMe "Constructing application list(s)"
 utiMailTo=$(get_uti_results "mailto")
 utiHttp=$(get_uti_results "https")
@@ -422,62 +526,135 @@ utiXLS=$(get_uti_results "xlsx")
 utiDoc=$(get_uti_results "docx")
 utiTxt=$(get_uti_results "txt")
 utiPDF=$(get_uti_results "pdf")
-utiMD=$(get_uti_results "md")
+utiMd=$(get_uti_results "md")
 
-# if you need to add new app types in here, make sure to use this template:
-# create_dropdown_message_body "Documents (doc):" "$utiDoc" "$(get_default_uti_app "docx")"
-# echo "}," >> $JSON_DIALOG_BLOB
-#
-# You need to copy/edit/paste both lines above into the code 
+# Construct the SwiftDialog JSON payload in JSON_DIALOG_BLOB
 logMe "Constructing display options"
-message="$SD_DIALOG_GREETING, $SD_FIRST_NAME. The default applications for each file types are shown below.  You can optionally change which applications will be used when you open the following types of files:"
+message="$SD_DIALOG_GREETING, {userfullname}.<br><br>Current default applications for each file type(s) are shown below.  You can optionally change which applications will be used when you open the following types of files:"
 construct_dialog_header_settings "$message" > "${JSON_DIALOG_BLOB}"
 create_dropdown_message_body "" "" "" "first"
-create_dropdown_message_body "Email App (mailto):" "$utiMailTo" "$(get_default_uti_app "mailto")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Web Browser (http):" "$utiHttp" "$(get_default_uti_app "http")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "File Transfer (ftp):" "$utiFtp" "$(get_default_uti_app "ftp")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Spreadsheet (xlsx):" "$utiXLS" "$(get_default_uti_app "xlsx")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Documents (doc):" "$utiDoc" "$(get_default_uti_app "docx")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Text Files (txt):" "$utiTxt" "$(get_default_uti_app "txt")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Markdown (md):" "$utiTxt" "$(get_default_uti_app "md")"
-echo "}," >> $JSON_DIALOG_BLOB
-create_dropdown_message_body "Portable Doc Format (pdf):" "$utiPDF" "$(get_default_uti_app "pdf")"
-echo "}]}" >> $JSON_DIALOG_BLOB
+# Add dropdown items conditionally based on UTI_LIST
+# FIRST_ITEM controls commas between JSON objects
+# if you need to add new app types in here, make sure to use this template:
+# [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+# FIRST_ITEM=false
+# create_dropdown_message_body "Documents (doc):" "$utiDoc" "$(get_default_uti_app "docx")"
+#
+# You need to copy/edit/paste lines above into the code in if statement
+FIRST_ITEM=true
+if [[ " ${UTI_LIST[*]} " == *" mailto "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Email App (mailto):" "$utiMailTo" "$(get_default_uti_app "mailto")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" https "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Web Browser (https):" "$utiHttp" "$(get_default_uti_app "https")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" ftp "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "File Transfer (ftp):" "$utiFtp" "$(get_default_uti_app "ftp")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" xlsx "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Spreadsheet (xlsx):" "$utiXLS" "$(get_default_uti_app "xlsx")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" docx "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Documents (docx):" "$utiDoc" "$(get_default_uti_app "docx")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" txt "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Text Files (txt):" "$utiTxt" "$(get_default_uti_app "txt")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" md "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Markdown (md):" "$utiMd" "$(get_default_uti_app "md")"
+fi
+
+if [[ " ${UTI_LIST[*]} " == *" pdf "* ]]; then
+    [[ "$FIRST_ITEM" == false ]] && echo "," >> "$JSON_DIALOG_BLOB"
+    FIRST_ITEM=false
+    create_dropdown_message_body "Portable Doc Format (pdf):" "$utiPDF" "$(get_default_uti_app "pdf")"
+fi
+echo "]}" >> "$JSON_DIALOG_BLOB"
 
 # Show the dialog screen and get the results
-results=$(${SW_DIALOG} --json --jsonfile "${JSON_DIALOG_BLOB}") 2>/dev/null
+results="$("${DIALOG_BINARY}" --json --jsonfile "${JSON_DIALOG_BLOB}" 2>/dev/null)"
 returnCode=$?
 
-[[ $returnCode == 2 ]] && {logMe "Cancel button pressed"; cleanup_and_exit 0;}
+# Cancel button
+if [[ "$returnCode" == 2 ]]; then
+    logMe "Cancel button pressed"
+    cleanup_and_exit 0
+fi
 
-# Extract the results
-# Make sure to extract your results from your own extension
-resultsMailTo=$(echo $results | jq '.["Email App (mailto):"].selectedValue')
-resultsHttp=$(echo $results | jq '.["Web Browser (http):"].selectedValue')
-resultsFtp=$(echo $results | jq '.["File Transfer (ftp):"].selectedValue')
-resultsXls=$(echo $results | jq '.["Spreadsheet (xlsx):"].selectedValue')
-resultsDoc=$(echo $results | jq '.["Documents (doc):"].selectedValue')
-resultsTxt=$(echo $results | jq '.["Text Files (txt):" ].selectedValue')
-resultsPDF=$(echo $results | jq '.["Portable Doc Format (pdf):" ].selectedValue')
-resultsMD=$(echo $results | jq '.["Markdown (md):"  ].selectedValue')
+# Extract the selected values from results 
+if [[ " ${UTI_LIST[*]} " == *" mailto "* ]]; then
+    resultsMailTo=$(echo "$results" | grep -A2 "Email App (mailto):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" http "* ]]; then
+    resultsHttp=$(echo "$results" | grep -A2 "Web Browser (http):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" ftp "* ]]; then
+    resultsFtp=$(echo "$results" | grep -A2 "File Transfer (ftp):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" xlsx "* ]]; then
+    resultsXls=$(echo "$results" | grep -A2 "Spreadsheet (xlsx):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" docx "* ]]; then
+    resultsDoc=$(echo "$results" | grep -A2 "Documents (docx):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" txt "* ]]; then
+    resultsTxt=$(echo "$results" | grep -A2 "Text Files (txt):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" pdf "* ]]; then
+    resultsPDF=$(echo "$results" | grep -A2 "Portable Doc Format (pdf):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
+if [[ " ${UTI_LIST[*]} " == *" md "* ]]; then
+    resultsMD=$(echo "$results" | grep -A2 "Markdown (md):" | grep -o '"selectedValue" *: *"[^"]*"' | cut -d'"' -f4)
+fi
 
-
-# and then set the new defaults
+# Apply selected defaults via utiluti
 # Call the "set_uti" function to set the results
-set_uti_results $resultsMailTo "mailto"
-set_uti_results $resultsHttp "http"
-set_uti_results $resultsFtp "ftp"
-set_uti_results $resultsXls "xlsx"
-set_uti_results $resultsDoc "docx"
-set_uti_results $resultsTxt "txt"
-set_uti_results $resultsPDF "pdf"
-set_uti_results $resultsMD "md"
+if [[ " ${UTI_LIST[*]} " == *" mailto "* ]]; then
+    set_uti_results "$resultsMailTo" "mailto"
+fi
+if [[ " ${UTI_LIST[*]} " == *" http "* ]]; then
+    set_uti_results "$resultsHttp" "http"
+fi
+if [[ " ${UTI_LIST[*]} " == *" ftp "* ]]; then
+    set_uti_results "$resultsFtp" "ftp"
+fi
+if [[ " ${UTI_LIST[*]} " == *" xlsx "* ]]; then
+    set_uti_results "$resultsXls" "xlsx"
+fi
+if [[ " ${UTI_LIST[*]} " == *" docx "* ]]; then
+    set_uti_results "$resultsDoc" "docx"
+fi
+if [[ " ${UTI_LIST[*]} " == *" txt "* ]]; then
+    set_uti_results "$resultsTxt" "txt"
+fi
+if [[ " ${UTI_LIST[*]} " == *" pdf "* ]]; then
+    set_uti_results "$resultsPDF" "pdf"
+fi
+if [[ " ${UTI_LIST[*]} " == *" md "* ]]; then
+    set_uti_results "$resultsMD" "md"
+fi
 
+#===============================================================================
+#=== Cleanup
+#===============================================================================
 cleanup_and_exit 0
-
