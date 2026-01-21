@@ -4,7 +4,7 @@
 #
 # Authors: Scott Kendall, ecubrooks
 # Created:  2025-12-11
-# Updated:  2026-01-13
+# Updated:  2026-01-21
 #
 # Purpose:
 #   Present a SwiftDialog UI that allows a user to set default handlers for
@@ -323,16 +323,28 @@ function get_uti_results ()
     # PRAMS: $1 = utiluti extension to look up
     # RETURN: A formatted list of applications
     # EXPECTED: None
-
     declare utiResults
     declare cleanResults
     declare -a resultsArray
     declare -a cleanArray
-    utiResults=$(runAsUser $UTI_COMMAND url list ${1})
-    if [[ -z "${utiResults}" ]]; then # the default list function returned blank, so we need to locate this another way
-        utiResults=$(runAsUser $UTI_COMMAND get-uti ${1})
-        utiResults=$(runAsUser $UTI_COMMAND type list ${utiResults})
+    case "${1:l}" in
+        https|ftp|ssh|mailto)
+            utiResults=$(runAsUser $UTI_COMMAND url list "${1:l}")
+        ;;
+        *)
+            utiResults=""  # force the if utiResults
+        ;;
+    esac
+    
+    # The default list function returned blank, so we need to locate this another way
+    if [[ -z "${utiResults}" ]]; then
+        utiResults="$(runAsUser "$UTI_COMMAND" get-uti "${1:l}")"
+        if [[ -z "${utiResults}" ]]; then
+            logMe "WARNING: get-uti returned blank for '${1:l}'"
+        fi
+        utiResults="$(runAsUser "$UTI_COMMAND" type list "${utiResults}")"
     fi
+    
     # Remove the prefixes from the app names
     cleanResults=$(echo "${utiResults}" |  grep -E '^(/System|/Applications)' | sed -e 's|^/Applications/||' -e 's|^/System/Applications/||' -e 's|^/System/Volumes/Preboot/Cryptexes/App/System/Applications/||' -e 's|^/System/Library/CoreServices/||' ) #remove the prefixes from the app names
     resultsArray=("${(@f)cleanResults}")
