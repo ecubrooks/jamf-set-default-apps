@@ -6,6 +6,24 @@ A Jamf-friendly **Self Service UI** for letting end users choose default applica
 
 The script builds a **swiftDialog** window with dropdown(s) and applies the selections using **utiluti**.
 
+## Credits / Background
+
+This project is based on Scott E. Kendall’s original “SetDefaultApps” script from his Jamf Pro Scripts collection.
+
+The original implementation established the core workflow: using swiftDialog to collect user selections and relying on Jamf policies (via manually entered triggers) to install required dependencies and support files.
+
+This repository is a fork of that work. The primary changes focus on how default apps are selected and applied through an updated method that allows administrators to choose which UTIs and URL schemes are presented to the end user. This allows a more flexible configurations and support for multiple presets.
+
+All credit for the original concept and structure belongs to Scott E. Kendall
+
+This script focuses on:
+- Parameter-driven configuration (presets or custom lists)
+- Easier rebranding and support for different environments
+
+Original repository (SetDefaultApps folder): [ScottEKendall/JAMF-Pro-Scripts.](https://github.com/ScottEKendall/JAMF-Pro-Scripts/tree/main/SetDefaultApps)
+
+---
+
 ## Screenshots
 
 ### Custom Selection (Multiple Types)
@@ -16,19 +34,6 @@ The script builds a **swiftDialog** window with dropdown(s) and applies the sele
 
 ### Web / Browser Preset
 ![SetDefaultApps Web Preset](SetDefaultApps/SetDefaultApps-PresetWeb.png)
-
-
----
-
-## Credits / Background
-
-This project is based on and inspired by **Scott E. Kendall’s original “SetDefaultApps” script** from his Jamf Pro Scripts collection. The original implementation established the overall workflow: use swiftDialog to collect user selections and rely on manual entered policy triggers to install dependencies/support files when needed.
-
-This fork/variant focuses on:
-- Parameter-driven configuration (presets or custom lists)
-- Easier rebranding and support for different environments
-
-Original repository (SetDefaultApps folder): [ScottEKendall/JAMF-Pro-Scripts.](https://github.com/ScottEKendall/JAMF-Pro-Scripts/tree/main/SetDefaultApps)
 
 ---
 
